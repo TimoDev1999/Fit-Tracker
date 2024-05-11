@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/streadway/amqp"
+	"log"
+	"net/http"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"net/http"
 )
 
 type Pfc struct {
@@ -17,9 +21,11 @@ type Pfc struct {
 	Carbs   float64 `json:"carbs"`
 	Date    string  `json:"date"`
 	Name    string  `json:"name"`
+	Email   string  `json:"email"`
 }
 
 func main() {
+	go scheduleJob()
 	router := gin.Default()
 	router.POST("/ping", func(c *gin.Context) {
 		var pfc Pfc
@@ -43,6 +49,7 @@ func main() {
 			existingPfc.Fats += pfc.Fats
 			existingPfc.Carbs += pfc.Carbs
 			existingPfc.Name = pfc.Name
+			existingPfc.Email = pfc.Email
 
 			// Обновляем запись в базе данных
 			err := mongoUpdater(existingPfc)
@@ -106,7 +113,7 @@ func mongoWriter(pfc Pfc) error {
 	usersCollection := client.Database("pfc").Collection("pfc")
 	pfcWrite := bson.D{
 		{"protein", pfc.Protein}, {"fats", pfc.Fats},
-		{"carbs", pfc.Carbs}, {"name", pfc.Name}, {"date", pfc.Date}}
+		{"carbs", pfc.Carbs}, {"name", pfc.Name}, {"date", pfc.Date}, {"email", pfc.Email}}
 	result, err := usersCollection.InsertOne(context.TODO(), pfcWrite)
 	if err != nil {
 		panic(err)
@@ -161,6 +168,7 @@ func mongoUpdater(pfc Pfc) error {
 			{"fats", pfc.Fats},
 			{"carbs", pfc.Carbs},
 			{"name", pfc.Name},
+			{"email", pfc.Email},
 		}},
 	}
 
@@ -191,4 +199,107 @@ func deleteByDate(date string) error {
 	}
 
 	return nil
+}
+
+func scheduleJob() {
+	fmt.Println("Trying to connect to RabbitMQ...")
+
+	rabbitURI := "amqp://guest:guest@localhost:5672/"
+	rabbitConn, err := amqp.Dial(rabbitURI)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rabbitConn.Close()
+
+	ch, err := rabbitConn.Channel()
+	if err != nil {
+		log.Fatal(err)
+
+	}
+
+	defer ch.Close()
+
+	// Создание очереди в RabbitMQ
+	queueName := "client_info"
+	_, err = ch.QueueDeclare(
+		queueName, // name
+		true,      // durable
+		false,     // delete when unused
+		false,     // exclusive
+		false,     // no-wait
+		nil,       // arguments
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Запуск шедулера
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	fmt.Println("Scheduler started...")
+	for range ticker.C {
+		uniqueClients, err := getUniqueClients()
+		if err != nil {
+			log.Printf("Ошибка при получении уникальных клиентов из MongoDB: %v", err)
+			continue
+		}
+		fmt.Println("Sending messages to RabbitMQ...")
+
+		// Отправка данных в RabbitMQ
+		for _, client := range uniqueClients {
+			message := fmt.Sprintf("Имя: %s, Email: %s", client.Name, client.Email)
+			err := ch.Publish(
+				"",        // exchange
+				queueName, // routing key
+				false,     // mandatory
+				false,     // immediate
+				amqp.Publishing{
+					ContentType: "text/plain",
+					Body:        []byte(message),
+				})
+			if err != nil {
+				log.Printf("Ошибка при отправке сообщения в RabbitMQ: %v", err)
+				continue
+			}
+			log.Printf("Сообщение отправлено в RabbitMQ: %s", message)
+		}
+	}
+}
+
+func getUniqueClients() ([]Pfc, error) {
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		return nil, err
+	}
+	defer client.Disconnect(context.TODO())
+
+	usersCollection := client.Database("pfc").Collection("pfc")
+	fmt.Println("Getting unique clients from MongoDB...")
+
+	pipeline := mongo.Pipeline{
+		{{"$group", bson.D{{"_id", "$name"}, {"email", bson.D{{"$first", "$email"}}}}}},
+	}
+	cursor, err := usersCollection.Aggregate(context.Background(), pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	var uniqueClients []Pfc
+	for cursor.Next(context.Background()) {
+		var result struct {
+			Name  string `bson:"Name"`
+			Email string `bson:"email"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			return nil, err
+		}
+		uniqueClients = append(uniqueClients, Pfc{Name: result.Name, Email: result.Email})
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
+
+	return uniqueClients, nil
 }

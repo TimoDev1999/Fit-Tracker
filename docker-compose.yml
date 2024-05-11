@@ -1,15 +1,29 @@
 version: '3'
-services:
-  zookeeper:
-    image: wurstmeister/zookeeper
-    ports:
-      - "2181:2181"
 
-  kafka:
-    image: wurstmeister/kafka
+services:
+  mongodb:
+    image: mongo
+    container_name: mongodb
     ports:
-      - "9092:9092"
-    environment:
-      KAFKA_ADVERTISED_HOST_NAME: localhost
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_CREATE_TOPICS: "client_topic:1:1" # создаем топик для клиентов
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  app:
+    build: .
+    container_name: myapp
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mongodb
+      - rabbitmq
+
+volumes:
+  mongodb_data:
