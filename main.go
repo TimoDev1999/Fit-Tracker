@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"github.com/streadway/amqp"
-	"log"
-	"net/http"
-	"time"
-
 	"github.com/gin-gonic/gin"
+	"github.com/go-gomail/gomail"
+	"github.com/streadway/amqp"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"log"
+	"net/http"
+	"strings"
+	"time"
 )
 
 type Pfc struct {
@@ -26,6 +28,7 @@ type Pfc struct {
 
 func main() {
 	go scheduleJob()
+	startRegularTask()
 	router := gin.Default()
 	router.POST("/ping", func(c *gin.Context) {
 		var pfc Pfc
@@ -102,13 +105,18 @@ func main() {
 
 		c.JSON(http.StatusOK, "Запись удалена")
 	})
-	router.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
+	err := router.Run(":9888")
+	if err != nil {
+		log.Fatalf("[Error] failed to start Gin server due to: %v", err)
+	}
 }
+
 func mongoWriter(pfc Pfc) error {
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
 	if err != nil {
-		panic(err)
+		return err
 	}
+	defer client.Disconnect(context.TODO())
 
 	usersCollection := client.Database("pfc").Collection("pfc")
 	pfcWrite := bson.D{
@@ -116,7 +124,7 @@ func mongoWriter(pfc Pfc) error {
 		{"carbs", pfc.Carbs}, {"name", pfc.Name}, {"date", pfc.Date}, {"email", pfc.Email}}
 	result, err := usersCollection.InsertOne(context.TODO(), pfcWrite)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	fmt.Println(result.InsertedID)
 	return nil
@@ -125,7 +133,7 @@ func mongoWriter(pfc Pfc) error {
 func getByDate(date string) ([]Pfc, error) {
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	usersCollection := client.Database("pfc").Collection("pfc")
 	filter := bson.D{
@@ -135,7 +143,7 @@ func getByDate(date string) ([]Pfc, error) {
 	cursor, err := usersCollection.Find(context.TODO(), filter)
 	// check for errors in the finding
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	defer cursor.Close(context.TODO())
 
@@ -143,12 +151,12 @@ func getByDate(date string) ([]Pfc, error) {
 		var result Pfc
 		err := cursor.Decode(&result)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 		results = append(results, result)
 	}
 	if err := cursor.Err(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	return results, nil
 }
@@ -201,19 +209,19 @@ func deleteByDate(date string) error {
 	return nil
 }
 
-func scheduleJob() {
+func scheduleJob() error {
 	fmt.Println("Trying to connect to RabbitMQ...")
 
 	rabbitURI := "amqp://guest:guest@localhost:5672/"
 	rabbitConn, err := amqp.Dial(rabbitURI)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer rabbitConn.Close()
 
 	ch, err := rabbitConn.Channel()
 	if err != nil {
-		log.Fatal(err)
+		return err
 
 	}
 
@@ -230,11 +238,11 @@ func scheduleJob() {
 		nil,       // arguments
 	)
 	if err != nil {
-		log.Fatal(err)
+		return nil
 	}
 
 	// Запуск шедулера
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	fmt.Println("Scheduler started...")
 	for range ticker.C {
@@ -264,6 +272,7 @@ func scheduleJob() {
 			log.Printf("Сообщение отправлено в RabbitMQ: %s", message)
 		}
 	}
+	return nil
 }
 
 func getUniqueClients() ([]Pfc, error) {
@@ -302,4 +311,109 @@ func getUniqueClients() ([]Pfc, error) {
 	}
 
 	return uniqueClients, nil
+}
+func startRegularTask() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			consumeMessages() // Добавляем вызов функции для чтения сообщений
+			log.Println("Regular task executed")
+		}
+	}
+}
+func consumeMessages() {
+	fmt.Println("Listening for messages from RabbitMQ...")
+
+	rabbitURI := "amqp://guest:guest@localhost:5672/"
+	rabbitConn, err := amqp.Dial(rabbitURI)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rabbitConn.Close()
+
+	ch, err := rabbitConn.Channel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ch.Close()
+
+	queueName := "client_info"
+	msgs, err := ch.Consume(
+		queueName, // queue
+		"",        // consumer
+		true,      // auto-ack
+		false,     // exclusive
+		false,     // no-local
+		false,     // no-wait
+		nil,       // args
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for msg := range msgs {
+		// Обработка сообщения
+		handleMessage(msg.Body)
+	}
+}
+
+func handleMessage(body []byte) {
+	// Преобразуем содержимое сообщения в строку
+	message := string(body)
+	fmt.Println("Received message from RabbitMQ:", message)
+
+	// Разбиваем сообщение на имя и email
+	parts := strings.Split(message, ", ")
+	if len(parts) != 2 {
+		log.Println("Invalid message format:", message)
+		return
+	}
+
+	name := strings.TrimPrefix(parts[0], "Имя: ")
+	email := strings.TrimPrefix(parts[1], "Email: ")
+
+	// Отправляем приветственное сообщение на почту клиента
+	sendWelcomeEmail(name, email)
+}
+func sendWelcomeEmail(name, email string) {
+	// Настройка клиента для отправки почты
+	sender := "mymail.timoshenko@mail.ru"
+	password := "d2UJAtv97NzydZML6KMx"
+	host := "smtp.mail.ru"
+	port := 465
+
+	// Создание сообщения
+	m := gomail.NewMessage()
+	m.SetHeader("From", sender)
+	m.SetHeader("To", email)
+	m.SetHeader("Subject", "Добро пожаловать, "+name+"!")
+	m.SetBody("text/html", "<b>Привет, "+name+"!</b><br>Спасибо за регистрацию.")
+
+	// Создание клиента для отправки почты
+	d := gomail.NewDialer(host, port, sender, password)
+	d.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+	// Отправка сообщения
+	retryAttempts := 3             // Количество попыток
+	retryDelay := time.Second * 10 // Задержка между попытками
+
+	// Повторная отправка сообщения в случае ошибки
+	for attempt := 1; attempt <= retryAttempts; attempt++ {
+		// Отправка сообщения
+		if err := d.DialAndSend(m); err != nil {
+			// Обработка ошибки
+			log.Printf("Ошибка при отправке письма на адрес %s в попытке %d: %v", email, attempt, err)
+			if attempt < retryAttempts {
+				time.Sleep(retryDelay)
+				continue // Повторная попытка отправки
+			}
+			log.Fatalf("Достигнуто максимальное количество попыток отправки письма на адрес %s", email)
+		}
+
+		fmt.Printf("Приветственное письмо отправлено на адрес %s\n", email)
+		break // Выход из цикла при успешной отправке
+	}
 }

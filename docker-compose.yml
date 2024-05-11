@@ -17,7 +17,7 @@ services:
       - "15672:15672"
 
   app:
-    build: .
+    build: main
     container_name: myapp
     ports:
       - "8080:8080"
