@@ -417,3 +417,10 @@ func sendWelcomeEmail(name, email string) {
 		break // Выход из цикла при успешной отправке
 	}
 }
+
+
+
+
+
+}
+
